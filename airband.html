@@ -401,6 +401,8 @@ async function startCamera() {
     video.classList.add('on');
     camBtn.hidden = false; camBtn.textContent = 'camera off';
   } catch (err) {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null; video.srcObject = null;
     camOn = false;
     camBtn.hidden = false; camBtn.textContent = 'camera on';
     flashHint('no camera — your pointer still plays');
