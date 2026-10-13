@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Air Band</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Music&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0c0c0e;
+      --fg: #ece8e1;
+      --muted: #7d786f;
+      --accent: #f2b84b;
+      --paper: #f5f2eb;
+      --ink: #1d1c1a;
+      --sheet-h: 180px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0 0 var(--sheet-h) 0;
+      touch-action: none;
+      cursor: crosshair;
+    }
+
+    #cam {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      opacity: 0;
+      filter: grayscale(1) contrast(1.1);
+      transition: opacity .6s;
+    }
+    #cam.on { opacity: .26; }
+
+    #fx { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+    #sheetWrap {
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      height: var(--sheet-h);
+      background: var(--paper);
+    }
+    #sheet { display: block; width: 100%; height: 100%; }
+
+    .ghost {
+      position: absolute;
+      background: none;
+      border: 0;
+      font: inherit;
+      font-size: 12px;
+      letter-spacing: .04em;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 8px 10px;
+    }
+    .ghost:hover { color: var(--fg); }
+    #camBtn { top: max(8px, env(safe-area-inset-top)); right: 8px; }
+    #clearBtn { top: 4px; right: 8px; color: #9a958b; }
+    #clearBtn:hover { color: var(--ink); }
+
+    #hint {
+      position: absolute;
+      top: max(14px, env(safe-area-inset-top));
+      left: 50%;
+      transform: translateX(-50%);
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: .03em;
+      pointer-events: none;
+      transition: opacity .8s;
+      white-space: nowrap;
+    }
+
+    #intro {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      padding: 24px;
+      text-align: center;
+      background: rgba(12, 12, 14, .94);
+      z-index: 10;
+      transition: opacity .5s;
+    }
+    #intro h1 { font-weight: 500; font-size: 30px; letter-spacing: .02em; }
+    #intro p { color: var(--muted); max-width: 340px; }
+    #intro button {
+      font: inherit;
+      font-size: 15px;
+      color: var(--bg);
+      background: var(--accent);
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 34px;
+      cursor: pointer;
+    }
+    #intro small { color: #5c5850; font-size: 12px; }
+    #intro.gone { opacity: 0; pointer-events: none; }
+  </style>
+</head>
+<body>
+
+  <div id="stage">
+    <video id="cam" playsinline muted></video>
+    <canvas id="fx"></canvas>
+    <div id="hint">move through the shapes</div>
+    <button id="camBtn" class="ghost" hidden>camera off</button>
+  </div>
+
+  <div id="sheetWrap">
+    <canvas id="sheet"></canvas>
+    <button id="clearBtn" class="ghost">clear</button>
+  </div>
+
+  <div id="intro">
+    <h1>Air Band</h1>
+    <p>Move your hand, mouse or finger through the shapes. Strings pluck, drums hit, and the score writes itself below.</p>
+    <button id="go">Start</button>
+    <small>Uses your camera if you allow it. Video never leaves this device.</small>
+  </div>
+
+<script>
+'use strict';
+
+/* ───────── Instruments ───────── */
+
+// Standard tuning. `pos` = written staff position on a treble-8vb staff (0 = bottom line).
+const STRINGS = [
+  { name: 'E', freq: 82.41,  pos: -7, gauge: 3.2 },
+  { name: 'A', freq: 110.00, pos: -4, gauge: 2.7 },
+  { name: 'D', freq: 146.83, pos: -1, gauge: 2.2 },
+  { name: 'G', freq: 196.00, pos: 2,  gauge: 1.8 },
+  { name: 'B', freq: 246.94, pos: 4,  gauge: 1.4 },
+  { name: 'E', freq: 329.63, pos: 7,  gauge: 1.1 },
+];
+
+// Standard drum-kit notation positions on a 5-line percussion staff.
+const DRUMS = [
+  { name: 'hi-hat', pos: 9, cross: true,  play: hat   },
+  { name: 'tom',    pos: 7, cross: false, play: tom   },
+  { name: 'snare',  pos: 5, cross: false, play: snare },
+  { name: 'kick',   pos: 1, cross: false, play: kick  },
+];
+
+/* ───────── DOM ───────── */
+
+const $ = s => document.querySelector(s);
+const stage = $('#stage'), fx = $('#fx'), ctx = fx.getContext('2d');
+const video = $('#cam'), hint = $('#hint'), camBtn = $('#camBtn');
+const sheet = $('#sheet'), sctx = sheet.getContext('2d');
+
+let W = 0, H = 0, SW = 0, SH = 0, DPR = 1;
+
+/* ───────── Shapes & layout ───────── */
+
+const shapes = [
+  ...STRINGS.map((s, i) => ({ kind: 'string', i, def: s })),
+  ...DRUMS.map((d, i) => ({ kind: 'drum', i, def: d })),
+];
+shapes.forEach(s => Object.assign(s, { armed: true, last: 0, hit: -1e9, vel: 0, level: 0, cells: [] }));
+
+function layout() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const r = stage.getBoundingClientRect();
+  W = r.width; H = r.height;
+  fx.width = W * DPR; fx.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  const sr = sheet.getBoundingClientRect();
+  SW = sr.width; SH = sr.height;
+  sheet.width = SW * DPR; sheet.height = SH * DPR;
+  sctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  const pad = Math.min(W, H) * 0.09;
+  const landscape = W > H * 1.05;
+  let drumBox;
+
+  if (landscape) {
+    const x0 = W * 0.47, x1 = W - pad, gap = (x1 - x0) / 6;
+    strings().forEach((s, i) => {
+      const x = x0 + gap * (i + 0.5);
+      s.a = { x, y: H * 0.1 }; s.b = { x, y: H * 0.9 };
+      s.band = Math.max(12, gap * 0.24);
+    });
+    drumBox = { x0: pad, y0: pad * 0.8, x1: W * 0.42, y1: H - pad * 0.8 };
+  } else {
+    const y0 = H * 0.08, y1 = H * 0.5, gap = (y1 - y0) / 6;
+    strings().forEach((s, i) => {
+      const y = y0 + gap * (i + 0.5);
+      s.a = { x: pad * 0.6, y }; s.b = { x: W - pad * 0.6, y };
+      s.band = Math.max(12, gap * 0.24);
+    });
+    drumBox = { x0: pad * 0.6, y0: H * 0.55, x1: W - pad * 0.6, y1: H - pad * 0.5 };
+  }
+
+  const cw = (drumBox.x1 - drumBox.x0) / 2, ch = (drumBox.y1 - drumBox.y0) / 2;
+  const rad = Math.min(cw, ch) * 0.4;
+  drums().forEach((d, i) => {
+    d.c = { x: drumBox.x0 + cw * (i % 2 + 0.5), y: drumBox.y0 + ch * (Math.floor(i / 2) + 0.5) };
+    d.r = rad;
+  });
+
+  gridDirty = true;
+}
+
+const strings = () => shapes.filter(s => s.kind === 'string');
+const drums = () => shapes.filter(s => s.kind === 'drum');
+
+function contains(s, x, y) {
+  if (s.kind === 'drum') return Math.hypot(x - s.c.x, y - s.c.y) <= s.r;
+  return distToSeg(x, y, s.a, s.b) <= s.band;
+}
+
+function distToSeg(x, y, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy)));
+  return Math.hypot(x - (a.x + t * dx), y - (a.y + t * dy));
+}
+
+function segmentsCross(p, q, a, b) {
+  const o = (u, v, w) => Math.sign((v.x - u.x) * (w.y - u.y) - (v.y - u.y) * (w.x - u.x));
+  return o(p, q, a) !== o(p, q, b) && o(a, b, p) !== o(a, b, q);
+}
+
+/* ───────── Audio ───────── */
+
+let ac = null, master = null, noiseBuf = null;
+const ringing = [];
+
+function initAudio() {
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 4;
+  master = ac.createGain(); master.gain.value = 0.9;
+  master.connect(comp).connect(ac.destination);
+
+  noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+  const n = noiseBuf.getChannelData(0);
+  for (let i = 0; i < n.length; i++) n[i] = Math.random() * 2 - 1;
+
+  STRINGS.forEach(s => { s.buf = pluckBuffer(s.freq); });
+}
+
+// Karplus–Strong plucked string, rendered once per string.
+function pluckBuffer(freq) {
+  const sr = ac.sampleRate, len = Math.floor(sr * 3.2), N = Math.round(sr / freq);
+  const buf = ac.createBuffer(1, len, sr), d = buf.getChannelData(0);
+  for (let i = 0; i < N; i++) d[i] = Math.random() * 2 - 1;
+  for (let i = 1; i < N; i++) d[i] = 0.5 * (d[i] + d[i - 1]);
+  const decay = freq < 120 ? 0.9985 : freq < 200 ? 0.997 : 0.9955;
+  for (let i = N; i < len; i++) d[i] = decay * 0.5 * (d[i - N] + d[i - N - 1 < 0 ? 0 : i - N - 1]);
+  let peak = 0;
+  for (let i = 0; i < len; i++) peak = Math.max(peak, Math.abs(d[i]));
+  const fade = Math.floor(sr * 0.3);
+  for (let i = 0; i < len; i++) d[i] = d[i] / peak * (i > len - fade ? (len - i) / fade : 1);
+  return buf;
+}
+
+function out(pan) {
+  if (!ac.createStereoPanner) return master;
+  const p = ac.createStereoPanner(); p.pan.value = pan; p.connect(master);
+  return p;
+}
+
+function pluck(i, vel) {
+  const t = ac.currentTime, s = STRINGS[i];
+  if (ringing[i]) { // a re-plucked string damps its previous note
+    ringing[i].gain.cancelScheduledValues(t);
+    ringing[i].gain.setTargetAtTime(0, t, 0.015);
+  }
+  const src = ac.createBufferSource(); src.buffer = s.buf;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1800 + vel * 3200;
+  const g = ac.createGain(); g.gain.value = 0.25 + vel * 0.45;
+  src.connect(lp).connect(g).connect(out(-0.35 + i * 0.14));
+  src.start(t);
+  ringing[i] = g;
+}
+
+function env(g, t, peak, decay) {
+  g.gain.setValueAtTime(peak, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + decay);
+}
+
+function noise(t, dur) {
+  const n = ac.createBufferSource(); n.buffer = noiseBuf;
+  n.start(t, Math.random() * 0.5); n.stop(t + dur);
+  return n;
+}
+
+function kick(vel) {
+  const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(42, t + 0.14);
+  env(g, t, 1.1 * vel, 0.45);
+  o.connect(g).connect(out(0)); o.start(t); o.stop(t + 0.5);
+}
+
+function snare(vel) {
+  const t = ac.currentTime;
+  const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1100;
+  const g = ac.createGain(); env(g, t, 0.75 * vel, 0.2);
+  noise(t, 0.25).connect(hp).connect(g).connect(out(0.1));
+  const o = ac.createOscillator(), og = ac.createGain();
+  o.type = 'triangle'; o.frequency.setValueAtTime(200, t);
+  o.frequency.exponentialRampToValueAtTime(150, t + 0.08);
+  env(og, t, 0.5 * vel, 0.12);
+  o.connect(og).connect(out(0.1)); o.start(t); o.stop(t + 0.15);
+}
+
+function hat(vel) {
+  const t = ac.currentTime;
+  const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7500;
+  const g = ac.createGain(); env(g, t, 0.45 * vel, 0.06);
+  noise(t, 0.08).connect(hp).connect(g).connect(out(-0.25));
+}
+
+function tom(vel) {
+  const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+  o.frequency.setValueAtTime(230, t);
+  o.frequency.exponentialRampToValueAtTime(120, t + 0.25);
+  env(g, t, 0.85 * vel, 0.45);
+  o.connect(g).connect(out(0.25)); o.start(t); o.stop(t + 0.5);
+}
+
+/* ───────── Triggering ───────── */
+
+function trigger(s, vel) {
+  const now = performance.now();
+  if (now - s.last < 70) return;
+  s.last = now; s.hit = now; s.vel = vel;
+  if (ac) {
+    if (s.kind === 'string') pluck(s.i, vel);
+    else s.def.play(vel);
+  }
+  record(s.kind === 'string' ? 'g' : 'd', s.def.pos, !!s.def.cross, now);
+  if (hint.style.opacity !== '0') hint.style.opacity = '0';
+}
+
+// Pointer: crossing a string line, or entering a drum, plays it.
+const pointers = new Map();
+const local = e => { const r = stage.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top, t: e.timeStamp }; };
+
+stage.addEventListener('pointerdown', e => {
+  const p = local(e);
+  pointers.set(e.pointerId, p);
+  for (const s of drums()) if (contains(s, p.x, p.y)) trigger(s, 0.8);
+});
+
+stage.addEventListener('pointermove', e => {
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of (evs.length ? evs : [e])) {
+    const p = local(ev), prev = pointers.get(e.pointerId);
+    pointers.set(e.pointerId, p);
+    if (!prev) continue;
+    const speed = Math.hypot(p.x - prev.x, p.y - prev.y) / Math.max(1, p.t - prev.t);
+    const vel = Math.max(0.3, Math.min(1, 0.25 + speed * 0.4));
+    for (const s of shapes) {
+      if (s.kind === 'string' ? segmentsCross(prev, p, s.a, s.b)
+                              : contains(s, p.x, p.y) && !contains(s, prev.x, prev.y)) trigger(s, vel);
+    }
+  }
+});
+
+['pointerup', 'pointercancel', 'pointerleave'].forEach(t =>
+  stage.addEventListener(t, e => pointers.delete(e.pointerId)));
+
+/* ───────── Camera motion ───────── */
+
+const mc = document.createElement('canvas');
+const mctx = mc.getContext('2d', { willReadFrequently: true });
+let stream = null, camOn = false, gridDirty = true, havePrev = false, lastScan = 0;
+let GW = 0, GH = 0, prevLum = null, moved = null;
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    camOn = true; havePrev = false; gridDirty = true;
+    video.classList.add('on');
+    camBtn.hidden = false; camBtn.textContent = 'camera off';
+  } catch (err) {
+    camOn = false;
+    camBtn.hidden = false; camBtn.textContent = 'camera on';
+    flashHint('no camera — your pointer still plays');
+  }
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; camOn = false;
+  video.classList.remove('on');
+  camBtn.textContent = 'camera on';
+  shapes.forEach(s => { s.level = 0; s.armed = true; });
+}
+
+camBtn.addEventListener('click', () => (camOn ? stopCamera() : startCamera()));
+
+// Map each cell of a small motion grid to the shape it falls in on screen
+// (accounting for object-fit: cover and the mirrored preview).
+function buildGrid() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  GW = 96; GH = Math.round(GW * vh / vw);
+  mc.width = GW; mc.height = GH;
+  prevLum = new Uint8Array(GW * GH); moved = new Uint8Array(GW * GH); havePrev = false;
+  const sc = Math.max(W / vw, H / vh), ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2;
+  shapes.forEach(s => { s.cells = []; });
+  for (let gy = 0; gy < GH; gy++) {
+    for (let gx = 0; gx < GW; gx++) {
+      const sx = W - (ox + (gx + 0.5) / GW * vw * sc), sy = oy + (gy + 0.5) / GH * vh * sc;
+      for (const s of shapes) if (contains(s, sx, sy)) s.cells.push(gy * GW + gx);
+    }
+  }
+  gridDirty = false;
+}
+
+function scanMotion(now) {
+  if (!camOn || video.readyState < 2 || !video.videoWidth || now - lastScan < 33) return;
+  lastScan = now;
+  if (gridDirty) buildGrid();
+
+  mctx.drawImage(video, 0, 0, GW, GH);
+  const px = mctx.getImageData(0, 0, GW, GH).data, n = GW * GH;
+  let total = 0;
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const l = (px[j] * 77 + px[j + 1] * 150 + px[j + 2] * 29) >> 8;
+    moved[i] = Math.abs(l - prevLum[i]) > 28 ? 1 : 0;
+    total += moved[i];
+    prevLum[i] = l;
+  }
+  if (!havePrev) { havePrev = true; return; }
+  if (total / n > 0.4) return; // exposure shift or camera bump, not a gesture
+
+  for (const s of shapes) {
+    const cells = s.cells;
+    if (cells.length < 4) continue;
+    let c = 0;
+    for (let k = 0; k < cells.length; k++) c += moved[cells[k]];
+    const f = c / cells.length;
+    s.level = Math.max(s.level * 0.75, f);
+    const thr = s.kind === 'string' ? 0.07 : 0.11;
+    if (s.armed && f > thr && c >= 4) {
+      trigger(s, Math.max(0.35, Math.min(1, 0.3 + f * 2.2)));
+      s.armed = false;
+    } else if (!s.armed && f < thr * 0.4) {
+      s.armed = true;
+    }
+  }
+}
+
+/* ───────── Stage drawing ───────── */
+
+function drawStage(now) {
+  ctx.clearRect(0, 0, W, H);
+  ctx.lineCap = 'round';
+
+  for (const s of strings()) {
+    const age = (now - s.hit) / 1000;
+    const glow = Math.max(0, 1 - age * 2.2);
+    const amp = (4 + s.vel * 10) * Math.exp(-age * 5) * (age < 3 ? 1 : 0);
+    const dx = s.b.x - s.a.x, dy = s.b.y - s.a.y, len = Math.hypot(dx, dy);
+    const nx = -dy / len, ny = dx / len;
+    const wob = Math.sin(now * (0.05 + s.i * 0.008)) * amp;
+
+    ctx.strokeStyle = glow > 0
+      ? `rgba(242,184,75,${0.5 + glow * 0.5})`
+      : `rgba(236,232,225,${0.42 + Math.min(0.4, s.level * 3)})`;
+    ctx.lineWidth = s.def.gauge;
+    ctx.beginPath();
+    if (Math.abs(wob) < 0.3) {
+      ctx.moveTo(s.a.x, s.a.y); ctx.lineTo(s.b.x, s.b.y);
+    } else {
+      for (let k = 0; k <= 40; k++) {
+        const t = k / 40, o = wob * Math.sin(Math.PI * t);
+        const x = s.a.x + dx * t + nx * o, y = s.a.y + dy * t + ny * o;
+        k ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = glow > 0 ? `rgba(242,184,75,${0.4 + glow * 0.6})` : '#5c5850';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const lx = s.a.x - (dx / len) * 14, ly = s.a.y - (dy / len) * 14;
+    ctx.fillText(s.def.name, lx, ly);
+  }
+
+  for (const d of drums()) {
+    const age = (now - d.hit) / 1000;
+    const glow = Math.max(0, 1 - age * 3);
+    const lvl = Math.min(0.25, d.level * 1.5);
+
+    ctx.beginPath(); ctx.arc(d.c.x, d.c.y, d.r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(127,179,213,${0.04 + lvl + glow * 0.3 * d.vel})`;
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = glow > 0 ? `rgba(242,184,75,${0.5 + glow * 0.5})` : 'rgba(236,232,225,.38)';
+    ctx.stroke();
+
+    if (age < 0.6) {
+      ctx.beginPath(); ctx.arc(d.c.x, d.c.y, d.r * (1 + age * 0.7), 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(242,184,75,${(1 - age / 0.6) * 0.5})`;
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = glow > 0 ? `rgba(242,184,75,${0.5 + glow * 0.5})` : '#6a665d';
+    ctx.font = '11px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(d.def.name, d.c.x, d.c.y);
+  }
+}
+
+/* ───────── Score ───────── */
+
+// Events are quantized to eighth notes at 120 bpm; long silences are compressed to one bar.
+const STEP_MS = 250, STEPS_PER_BAR = 8, MAX_GAP = 8;
+let cols = [], lastT = 0, scroll = 0;
+
+function record(staff, pos, cross, now) {
+  let step = 0, col = cols[cols.length - 1];
+  if (col) step = col.step + Math.min(MAX_GAP, Math.round((now - lastT) / STEP_MS));
+  if (!col || col.step !== step) {
+    col = { step, g: [], d: [], t: now };
+    cols.push(col);
+    lastT = now;
+    if (cols.length > 4000) cols.splice(0, 1000);
+  }
+  const notes = col[staff];
+  if (!notes.some(n => n.pos === pos)) notes.push({ pos, cross });
+}
+
+$('#clearBtn').addEventListener('click', () => { cols = []; scroll = 0; });
+
+const LS = 7;               // staff space in px
+const HEAD_X = 78;          // width of clef/time-signature header
+const STEP_W = 24;
+
+function staffGeom() {
+  const gTop = 30, gBot = gTop + 4 * LS;
+  const dTop = gBot + 58, dBot = dTop + 4 * LS;
+  return { gTop, gBot, dTop, dBot };
+}
+
+const yOf = (bot, pos) => bot - pos * LS / 2;
+
+function drawSheet(now) {
+  const { gTop, gBot, dTop, dBot } = staffGeom();
+  sctx.fillStyle = getCss('--paper');
+  sctx.fillRect(0, 0, SW, SH);
+  const ink = getCss('--ink');
+
+  // Staff lines
+  sctx.strokeStyle = 'rgba(29,28,26,.55)'; sctx.lineWidth = 1;
+  for (const top of [gTop, dTop]) {
+    for (let k = 0; k < 5; k++) {
+      const y = Math.round(top + k * LS) + 0.5;
+      sctx.beginPath(); sctx.moveTo(12, y); sctx.lineTo(SW - 12, y); sctx.stroke();
+    }
+  }
+  sctx.beginPath(); sctx.moveTo(12.5, gTop); sctx.lineTo(12.5, dBot); sctx.stroke();
+
+  // Clefs and time signatures
+  sctx.fillStyle = ink;
+  drawTreble(22, gTop, gBot);
+  sctx.font = 'italic 10px Georgia, serif'; sctx.textAlign = 'center'; sctx.textBaseline = 'top';
+  sctx.fillText('8', 33, gBot + LS * 2.6);
+  sctx.fillRect(28, yOf(dBot, 6), 3.5, LS * 2);
+  sctx.fillRect(34, yOf(dBot, 6), 3.5, LS * 2);
+  for (const top of [gTop, dTop]) {
+    sctx.font = `bold ${LS * 2.4}px Georgia, serif`; sctx.textBaseline = 'middle';
+    sctx.fillText('4', 60, top + LS * 1);
+    sctx.fillText('4', 60, top + LS * 3);
+  }
+
+  if (!cols.length) {
+    sctx.fillStyle = 'rgba(29,28,26,.35)';
+    sctx.font = '12px system-ui, sans-serif'; sctx.textAlign = 'left'; sctx.textBaseline = 'middle';
+    sctx.fillText('your notes appear here', HEAD_X + 16, (gBot + dTop) / 2);
+    return;
+  }
+
+  // Follow the newest note
+  const lastStep = cols[cols.length - 1].step;
+  const target = Math.max(0, (lastStep + 1) * STEP_W - (SW - HEAD_X - 60));
+  scroll += (target - scroll) * 0.15;
+  if (Math.abs(target - scroll) < 0.5) scroll = target;
+  const xOf = step => HEAD_X + 16 + step * STEP_W - scroll;
+
+  sctx.save();
+  sctx.beginPath(); sctx.rect(HEAD_X, 0, SW - HEAD_X, SH); sctx.clip();
+
+  // Bar lines
+  sctx.strokeStyle = 'rgba(29,28,26,.55)';
+  const firstBar = Math.max(1, Math.floor((scroll / STEP_W) / STEPS_PER_BAR));
+  for (let b = firstBar; ; b++) {
+    const x = Math.round(xOf(b * STEPS_PER_BAR) - STEP_W / 2) + 0.5;
+    if (x > SW) break;
+    sctx.beginPath(); sctx.moveTo(x, gTop); sctx.lineTo(x, gBot); sctx.moveTo(x, dTop); sctx.lineTo(x, dBot); sctx.stroke();
+  }
+
+  // Notes
+  for (let c = 0; c < cols.length; c++) {
+    const col = cols[c], x = xOf(col.step);
+    if (x < HEAD_X - STEP_W || x > SW + STEP_W) continue;
+    const fresh = now - col.t < 350;
+    const color = fresh ? '#c98a16' : ink;
+    if (col.g.length) drawChord(x, gBot, col.g, color, duration(c, 'g', 4), false);
+    if (col.d.length) {
+      const feet = col.d.filter(n => n.pos < 3), hands = col.d.filter(n => n.pos >= 3);
+      const dur = duration(c, 'd', 2);
+      if (hands.length) drawChord(x, dBot, hands, color, dur, true, 'up');
+      if (feet.length) drawChord(x, dBot, feet, color, dur, true, 'down');
+    }
+  }
+  sctx.restore();
+}
+
+// Length (in eighths) until the next note on the same staff, capped.
+function duration(c, staff, cap) {
+  for (let k = c + 1; k < cols.length; k++) {
+    if (cols[k][staff].length) return Math.min(cap, cols[k].step - cols[c].step);
+  }
+  return 2;
+}
+
+function drawChord(x, bot, notes, color, dur, perc, forceDir) {
+  const ps = notes.map(n => n.pos).sort((a, b) => a - b);
+  const lo = ps[0], hi = ps[ps.length - 1];
+  const dir = forceDir || ((lo + hi) / 2 >= 4 ? 'down' : 'up');
+  const rx = LS * 0.62, ry = LS * 0.44;
+  const hollow = dur >= 4 && !perc;
+
+  sctx.strokeStyle = color; sctx.fillStyle = color;
+
+  // Ledger lines
+  sctx.lineWidth = 1;
+  for (let p = -2; p >= lo; p -= 2) line(x - rx - 3, yOf(bot, p), x + rx + 3, yOf(bot, p));
+  for (let p = 10; p <= hi; p += 2) line(x - rx - 3, yOf(bot, p), x + rx + 3, yOf(bot, p));
+
+  for (const n of notes) {
+    const y = yOf(bot, n.pos);
+    if (n.cross) {
+      sctx.lineWidth = 1.6;
+      line(x - rx * 0.75, y - ry, x + rx * 0.75, y + ry);
+      line(x - rx * 0.75, y + ry, x + rx * 0.75, y - ry);
+    } else {
+      sctx.beginPath(); sctx.ellipse(x, y, rx, ry, -0.35, 0, Math.PI * 2);
+      if (hollow) { sctx.lineWidth = 1.6; sctx.stroke(); } else sctx.fill();
+    }
+    if (dur === 3 && !perc) {
+      sctx.beginPath(); sctx.arc(x + rx + 4, y - (n.pos % 2 === 0 ? LS / 2 : 0), 1.6, 0, Math.PI * 2); sctx.fill();
+    }
+  }
+
+  // Stem and flag
+  sctx.lineWidth = 1.2;
+  const stemLen = LS * 3.5;
+  let sx, y0, y1;
+  if (dir === 'up') { sx = x + rx - 0.6; y0 = yOf(bot, lo); y1 = yOf(bot, hi) - stemLen; }
+  else { sx = x - rx + 0.6; y0 = yOf(bot, hi); y1 = yOf(bot, lo) + stemLen; }
+  line(sx, y0, sx, y1);
+  if (dur === 1) {
+    const s = dir === 'up' ? 1 : -1;
+    sctx.lineWidth = 1.6; sctx.beginPath(); sctx.moveTo(sx, y1);
+    sctx.bezierCurveTo(sx + 1, y1 + s * LS * 1.1, sx + LS * 1.3, y1 + s * LS * 1.3, sx + LS * 0.8, y1 + s * LS * 2.7);
+    sctx.stroke();
+  }
+}
+
+function line(x0, y0, x1, y1) { sctx.beginPath(); sctx.moveTo(x0, y0); sctx.lineTo(x1, y1); sctx.stroke(); }
+
+// Fit the treble-clef glyph to the staff by its measured bounds, so it lands correctly in any font.
+function drawTreble(x, top, bot) {
+  const glyph = '\u{1D11E}';
+  sctx.font = '100px "Noto Music", "Segoe UI Symbol", "Apple Symbols", serif';
+  const m = sctx.measureText(glyph);
+  const gh = m.actualBoundingBoxAscent + m.actualBoundingBoxDescent;
+  if (!gh) return;
+  const want = (bot - top) + LS * 3.2, k = want / gh;
+  sctx.font = `${100 * k}px "Noto Music", "Segoe UI Symbol", "Apple Symbols", serif`;
+  sctx.textAlign = 'left'; sctx.textBaseline = 'alphabetic';
+  sctx.fillText(glyph, x - m.actualBoundingBoxLeft * k, top - LS * 1.6 + m.actualBoundingBoxAscent * k);
+}
+
+const cssCache = {};
+function getCss(name) {
+  return cssCache[name] || (cssCache[name] = getComputedStyle(document.documentElement).getPropertyValue(name).trim());
+}
+
+/* ───────── Loop & start ───────── */
+
+function frame(now) {
+  scanMotion(now);
+  drawStage(now);
+  drawSheet(now);
+  requestAnimationFrame(frame);
+}
+
+function flashHint(text) {
+  hint.textContent = text; hint.style.opacity = '1';
+  setTimeout(() => { hint.style.opacity = '0'; }, 3500);
+}
+
+$('#go').addEventListener('click', async () => {
+  initAudio();
+  if (ac.state === 'suspended') await ac.resume();
+  $('#intro').classList.add('gone');
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) await startCamera();
+  else { camBtn.hidden = true; flashHint('no camera — your pointer still plays'); }
+});
+
+window.addEventListener('resize', layout);
+document.fonts && document.fonts.load('40px "Noto Music"', '\u{1D11E}').catch(() => {});
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
